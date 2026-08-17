@@ -8,7 +8,6 @@ Stranded Deep（深海搁浅）联机增强模组 —— 让游戏脱离 Photon 
 | 作者 | Chengxidaxia |
 | 注入方式 | BepInEx（Harmony 补丁） |
 | GUID | `com.chengxidaxia.multiplayerplus` |
-| 版本 | 1.0.0 |
 | 依赖 | 游戏自带的 Photon Bolt + udpkit（无需额外运行时库） |
 
 ---
@@ -29,7 +28,7 @@ Stranded Deep（深海搁浅）联机增强模组 —— 让游戏脱离 Photon 
 1. 把 `MultiplayerPlus.dll` 放入游戏的 BepInEx 插件目录：
 
    ```
-   $BeplnEx目录$\plugins\MultiplayerPlus\MultiplayerPlus.dll
+   {BeplnEx}\plugins\MultiplayerPlus\MultiplayerPlus.dll
    ```
 
 2. 启动游戏，BepInEx 自动加载。首次运行后会在 `$BeplnEx目录$\config\` 生成配置文件。
