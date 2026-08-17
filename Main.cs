@@ -13,6 +13,7 @@ namespace MultiplayerPlus
         public ConfigEntry<int> ListenPort;
         public ConfigEntry<string> ConnectAddress;
         public ConfigEntry<float> ChatScale;
+        public ConfigEntry<int> MaxPlayersEntry;
 
         private Harmony _harmony;
 
@@ -37,6 +38,14 @@ namespace MultiplayerPlus
                 "Scale",
                 1.0f,
                 "聊天框缩放倍数（1.0 = 默认大小，可调大看更多/更大字）。");
+
+            MaxPlayersEntry = Config.Bind(
+                "Network",
+                "MaxPlayers",
+                2,
+                "联机人数上限（房主创建联机时生效，范围 2~8）。");
+
+            PlayerIdManager.MaxPlayers = MaxPlayersEntry.Value;
 
             _harmony = new Harmony(PluginInfo.GUID);
             _harmony.PatchAll();
