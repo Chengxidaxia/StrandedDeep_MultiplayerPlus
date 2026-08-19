@@ -95,14 +95,75 @@ namespace MultiplayerPlus
         }
     }
 
-    // 2. 房主固定监听端口（原版用随机端口）
+    // 2. 房主固定监听端口（原版用随机端口）+ 调大 Bolt 底层连接超时
     [HarmonyPatch(typeof(BoltLauncher), "StartServer", new Type[] { typeof(BoltConfig), typeof(string) })]
     internal static class Patch_StartServer
     {
         private static bool Prefix(BoltConfig config, string scene)
         {
+            BoltTimeoutUtil.BumpBoltTimeouts(config);
             ushort port = (ushort)MultiplayerPlusPlugin.Instance.ListenPort.Value;
             BoltLauncher.StartServer(new UdpEndPoint(UdpIPv4Address.Any, port), config, scene);
+            return false;
+        }
+    }
+
+    // 2b. 客户端启动 Bolt 时同样调大底层连接超时（否则客户端可能比房主更早超时）
+    [HarmonyPatch(typeof(BoltLauncher), "StartClient", new Type[] { typeof(BoltConfig) })]
+    internal static class Patch_StartClientTimeout
+    {
+        private static void Prefix(BoltConfig config)
+        {
+            BoltTimeoutUtil.BumpBoltTimeouts(config);
+        }
+    }
+
+    /// <summary>把 BoltConfig 的底层连接/心跳超时调大，防加载卡顿/瞬时丢包误判断线。</summary>
+    internal static class BoltTimeoutUtil
+    {
+        internal static void BumpBoltTimeouts(BoltConfig config)
+        {
+            if (config == null)
+            {
+                return;
+            }
+            try
+            {
+                SetBoltConfigValue(config, "connectionTimeout", 30000);   // 等待消息超时 30s
+                SetBoltConfigValue(config, "stayAliveTimeout", 45000);    // 心跳超时 45s
+                Debug.Log("[MultiplayerPlus] Bolt timeouts bumped: connection=30s stayAlive=45s");
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning("[MultiplayerPlus] bolt timeout bump failed: " + e.Message);
+            }
+        }
+
+        private static void SetBoltConfigValue(BoltConfig config, string name, int value)
+        {
+            Traverse field = Traverse.Create(config).Field(name);
+            if (field.FieldExists())
+            {
+                field.SetValue(value);
+                return;
+            }
+            Traverse prop = Traverse.Create(config).Property(name);
+            if (prop.PropertyExists())
+            {
+                prop.SetValue(value);
+            }
+        }
+    }
+
+    // 2c. 游戏在加载区域/主菜单时会把超时重置为 Peer.GetSessionTimeout()
+    //     （读 Bolt 配置的 connectionTimeout/1000，可能只有 10 秒），
+    //     这里统一返回 30 秒，避免被重置回短超时。
+    [HarmonyPatch(typeof(Peer), "GetSessionTimeout")]
+    internal static class Patch_GetSessionTimeout
+    {
+        private static bool Prefix(ref float __result)
+        {
+            __result = 30f;
             return false;
         }
     }
@@ -643,14 +704,14 @@ namespace MultiplayerPlus
     }
 
     // 15b. 直连模式没有 matchmaking 会话，客户端退出时房主端 UpdateToken() 会因
-    //      BoltMatchmaking.CurrentSession 为 null 抛 NRE（日志刷红字，不影响游戏），
-    //      这里直接跳过。
+    //      BoltMatchmaking.CurrentSession 为 null / GetToken() 为 null 抛 NRE（日志刷红字）。
+    //      直连联机根本不更新 Photon 房间令牌，联机模式下永远跳过；单人模式保留原逻辑。
     [HarmonyPatch(typeof(MultiplayerMng), "UpdateToken")]
     internal static class Patch_UpdateTokenSafe
     {
         private static bool Prefix()
         {
-            return Photon.Bolt.Matchmaking.BoltMatchmaking.CurrentSession != null;
+            return !Game.Mode.IsMultiplayer();
         }
     }
 
@@ -658,24 +719,53 @@ namespace MultiplayerPlus
     //     头显隐完全由 Character.PlayerCamera_RenderingCameraChanged(ourCamera) 控制。
     //     其 ourCamera=false 分支（"别人看你"）会：隐藏 FirstPerson、显示 ThirdPerson 并启用头部。
     //     但远程玩家相机在 PlayerCamera.Attached() 里 SetActive(false)，Cameras_OnPreCull 不会
-    //     为它触发 → 该方法在 MP 下对远程角色从未被调用 → 头停在 prefab 默认（隐藏），
-    //     且默认激活的可能是 FirstPerson 渲染器，单开 TP 头看不到。
-    //     修复思路（用游戏自带的正确逻辑，避免 v1 每帧暴力强制造成的贴图混乱）：
+    //     为它触发 → 该方法在 MP 下对远程角色从未被调用 → 头停在 prefab 默认（隐藏）。
+    //     v3 仅在 SetPlayer 时调用一次，但远程角色渲染器刚 Instantiate 出来未稳定，
+    //     后续初始化/渲染器状态重置可能再次关掉头部 → 单次调用不可靠。
+    //     v4 方案（自愈）：
     //     (a) Prefix 强制非 owner 角色走 ourCamera=false 分支（显示 TP+头、隐藏 FP），
     //         这样即使原相机事件将来触发也是正确状态；
-    //     (b) Postfix 在 Character.SetPlayer 完成后，显式对非 owner 角色调用一次
-    //         PlayerCamera_RenderingCameraChanged(false)，确保头部一定被启用（不依赖相机事件）。
+    //     (b) SetPlayer Postfix 立即应用一次 + 输出头部渲染器状态诊断日志；
+    //     (c) CharacterRenderer.Update Postfix 看门狗：对远程 TP 渲染器每帧
+    //         强制应用"别人看你"状态，任何时机被重新隐藏都能自愈。走游戏自带方法，
+    //         绝不会造成 v1 那种贴图混乱（v1 是把 FP+TP 全部头渲染器每帧强开）。
+    internal static class RemoteHeadUtil
+    {
+        internal static readonly AccessTools.FieldRef<Character, IPlayer> PlayerRef =
+            AccessTools.FieldRefAccess<Character, IPlayer>("_player");
+
+        internal static readonly AccessTools.FieldRef<CharacterRenderer, IPlayer> RendererPlayerRef =
+            AccessTools.FieldRefAccess<CharacterRenderer, IPlayer>("_player");
+
+        internal static readonly MethodInfo RenderMethod =
+            AccessTools.Method(typeof(Character), "PlayerCamera_RenderingCameraChanged", new[] { typeof(bool) });
+
+        /// <summary>强制 Character 处于"别人看你"状态：隐藏 FP、显示 TP 并启用头部。</summary>
+        internal static void ApplyRemoteHead(Character character, string tag)
+        {
+            if (character == null || RenderMethod == null)
+            {
+                return;
+            }
+            try
+            {
+                RenderMethod.Invoke(character, new object[] { false });
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning("[MP-Head] apply(" + tag + ") failed: " + e.Message);
+            }
+        }
+    }
+
     [HarmonyPatch(typeof(Character), "PlayerCamera_RenderingCameraChanged")]
     internal static class Patch_RenderingCameraChanged_RemoteHead
     {
-        private static readonly AccessTools.FieldRef<Character, IPlayer> PlayerRef =
-            AccessTools.FieldRefAccess<Character, IPlayer>("_player");
-
         private static void Prefix(Character __instance, ref bool ourCamera)
         {
             try
             {
-                IPlayer player = PlayerRef(__instance);
+                IPlayer player = RemoteHeadUtil.PlayerRef(__instance);
                 if (player != null && !player.IsOwner)
                 {
                     // 远程玩家始终按"别人看你"的第三人称+头部逻辑渲染
@@ -692,33 +782,69 @@ namespace MultiplayerPlus
     [HarmonyPatch(typeof(Character), "SetPlayer")]
     internal static class Patch_CharacterSetPlayer_RemoteHead
     {
-        private static readonly AccessTools.FieldRef<Character, IPlayer> PlayerRef =
-            AccessTools.FieldRefAccess<Character, IPlayer>("_player");
-
-        private static readonly MethodInfo RenderMethod =
-            AccessTools.Method(typeof(Character), "PlayerCamera_RenderingCameraChanged", new[] { typeof(bool) });
-
         private static void Postfix(Character __instance)
         {
             try
             {
-                IPlayer player = PlayerRef(__instance);
+                IPlayer player = RemoteHeadUtil.PlayerRef(__instance);
                 if (player == null || player.IsOwner)
                 {
                     return; // 只处理远程玩家；本地玩家由原始相机事件处理
                 }
-                if (RenderMethod == null)
+                RemoteHeadUtil.ApplyRemoteHead(__instance, "SetPlayer");
+                // 诊断：输出 TP 头部渲染器数量与 enabled 状态（确认 _headRenderers 是否为空）
+                CharacterRenderer tp = Traverse.Create(__instance).Field("_characterThirdPerson").GetValue<CharacterRenderer>();
+                if (tp != null)
                 {
-                    return;
+                    Renderer[] head = Traverse.Create(tp).Field("_headRenderers").GetValue<Renderer[]>();
+                    string state = head == null
+                        ? "null"
+                        : string.Join(",", System.Array.ConvertAll(head, r => r != null ? r.enabled.ToString() : "null"));
+                    Debug.Log("[MP-Head] player " + player.Id + " after SetPlayer: TP head count="
+                        + (head != null ? head.Length.ToString() : "null") + " enabled=[" + state + "]");
                 }
-                // 显式触发一次"别人看你"渲染分支：隐藏 FP、显示 TP 并启用头部。
-                // 走游戏自带方法，绝不会造成贴图混乱（v1 直接操作 Renderer 才导致混乱）。
-                RenderMethod.Invoke(__instance, new object[] { false });
                 Debug.Log("[MultiplayerPlus] Remote head fix applied for player " + player.Id);
             }
             catch (Exception e)
             {
                 Debug.LogWarning("[MultiplayerPlus] remote head fix failed: " + e.Message);
+            }
+        }
+    }
+
+    // 16b. 看门狗：远程 TP 渲染器每帧强制"别人看你"状态，自愈任何重新隐藏头部/身体的情况。
+    [HarmonyPatch(typeof(CharacterRenderer), "Update")]
+    internal static class Patch_RemoteHeadWatchdog
+    {
+        private static readonly HashSet<int> _logged = new HashSet<int>();
+
+        private static void Postfix(CharacterRenderer __instance)
+        {
+            try
+            {
+                if (!__instance.THIRD_PERSON_CHARACTER)
+                {
+                    return; // 只看第三人称渲染器（远程玩家以 TP 显示）
+                }
+                IPlayer player = RemoteHeadUtil.RendererPlayerRef(__instance);
+                if (player == null || player.IsOwner)
+                {
+                    return;
+                }
+                Character character = player.Character;
+                if (character == null)
+                {
+                    return;
+                }
+                RemoteHeadUtil.ApplyRemoteHead(character, "watchdog");
+                if (_logged.Add(player.Id))
+                {
+                    Debug.Log("[MP-Head] watchdog enforcing remote TP state for player " + player.Id);
+                }
+            }
+            catch (Exception)
+            {
+                // 静默：看门狗失败不打扰游戏
             }
         }
     }

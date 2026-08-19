@@ -37,6 +37,9 @@ namespace MultiplayerPlus
         // 打开聊天的 T 键当前是否还按着（KeyDown 置 true，KeyUp 置 false）。
         // 用于：按住 T 时不聚焦输入框（防 T 漏进输入框），松开 T 后才聚焦。
         private bool _tHeld;
+        // 本次打开聊天是否已聚焦过输入框（聚焦一次后不再每帧重复 FocusControl，
+        // 避免干扰中文输入法的拼音组合输入）。
+        private bool _chatFocused;
         private float _showMessagesUntil;
         private bool _prevCursorVisible;
         private CursorLockMode _prevCursorLockMode;
@@ -267,9 +270,14 @@ namespace MultiplayerPlus
             }
             else if (UnityEngine.Event.current != null && UnityEngine.Event.current.type == UnityEngine.EventType.KeyUp && UnityEngine.Event.current.keyCode == KeyCode.T)
             {
-                // “打开键”松开：标记可聚焦（DrawChat 里据此把焦点给输入框）
-                _tHeld = false;
-                UnityEngine.Event.current.Use();
+                // 只消费“打开键 T”的松开（_tHeld 为 true 时）。聊天打开后正常打字按的
+                // T 完全放行，不 Use —— 否则中文输入法打拼音时该字母的 KeyUp 被吃掉，
+                // 会导致包含 't' 的文字拼音组合/输入异常。
+                if (_tHeld)
+                {
+                    _tHeld = false;
+                    UnityEngine.Event.current.Use();
+                }
             }
 
             EnsureStyles();
@@ -301,6 +309,7 @@ namespace MultiplayerPlus
         {
             _chatOpen = true;
             _chatInput = "";
+            _chatFocused = false;
             // 关键：清空 Unity 全局键盘焦点。IMGUI 关闭聊天后 GUIUtility.keyboardControl
             // 仍残留指向 MPChatInput（控件 ID 布局稳定、每次相同），导致第二次起打开聊天时
             // 输入框一绘制就处于“残留聚焦”状态，会把打开聊天的 T 按键吞进输入框（多出 't'）。
@@ -322,6 +331,7 @@ namespace MultiplayerPlus
             _chatOpen = false;
             _chatInput = "";
             _tHeld = false;
+            _chatFocused = false;
             GUIUtility.keyboardControl = 0; // 关闭时同步清焦，避免焦点残留到下次打开
             Cursor.visible = _prevCursorVisible;
             Cursor.lockState = _prevCursorLockMode;
@@ -441,10 +451,12 @@ namespace MultiplayerPlus
                 GUI.SetNextControlName("MPChatInput");
                 _chatInput = GUI.TextField(new Rect(x + pad, ty, inputW, inputH), _chatInput, _inputStyle);
                 // 聚焦：打开聊天且“打开键 T”还按着时不聚焦（防止 T 漏进输入框）；
-                // 一旦 T 松开就聚焦，并且之后每帧保持焦点，确保输入框持续可输入。
-                if (!_tHeld)
+                // T 松开后一次性聚焦（_chatFocused 只置一次），不再每帧重复 FocusControl，
+                // 避免干扰中文输入法拼音组合；聚焦后点击输入框仍可自然获得焦点。
+                if (!_chatFocused && !_tHeld)
                 {
                     GUI.FocusControl("MPChatInput");
+                    _chatFocused = true;
                 }
 
                 if (GUI.Button(new Rect(x + pad + inputW + btnGap, ty, btnW, inputH), "发送", _buttonStyle))

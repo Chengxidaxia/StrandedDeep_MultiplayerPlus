@@ -1,4 +1,5 @@
-﻿using BepInEx;
+﻿using System;
+using BepInEx;
 using BepInEx.Configuration;
 using HarmonyLib;
 using UnityEngine;
@@ -49,6 +50,24 @@ namespace MultiplayerPlus
 
             _harmony = new Harmony(PluginInfo.GUID);
             _harmony.PatchAll();
+
+            // 调大游戏自带的“对等超时”（Peer.DEFAULT_TIMEOUT，默认 8 秒）：
+            // 房主加载世界/光影包编译等卡顿时主线程泵消息变慢，8 秒内收不到消息/心跳
+            // 就会被游戏自己的看门狗以 Timeout_Messages / Timeout_StayAlive 误踢。
+            // 调成 30 秒，加载卡顿和瞬时丢包都能扛过去，不影响正常断线检测。
+            try
+            {
+                System.Reflection.FieldInfo timeoutField = AccessTools.Field(typeof(Funlabs.Peer), "DEFAULT_TIMEOUT");
+                if (timeoutField != null)
+                {
+                    timeoutField.SetValue(null, 30f);
+                    Logger.LogInfo("Peer.DEFAULT_TIMEOUT bumped to 30s (was 8s)");
+                }
+            }
+            catch (Exception e)
+            {
+                Logger.LogWarning("bump peer timeout failed: " + e.Message);
+            }
 
             GameObject go = new GameObject("MultiplayerPlus");
             DontDestroyOnLoad(go);
