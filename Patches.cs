@@ -7,9 +7,11 @@ using Beam.UI;
 using Funlabs;
 using HarmonyLib;
 using Photon.Bolt;
+using Photon.Bolt.Matchmaking;
 using UdpKit;
 using UdpKit.Platform;
 using UnityEngine;
+using UnityEngine.Rendering;
 
 namespace MultiplayerPlus
 {
@@ -599,4 +601,126 @@ namespace MultiplayerPlus
             return _token;
         }
     }
+
+    // 15. 别人（非房主）退出不结束游戏。
+    //     原版 Peer_Extensions.Disconnect 只对 id==1（第 2 人）温和断线，id!=1 一律
+    //     MultiplayerMng.Shutdown() 关闭整个联机会话。MP 扩展后第 3+ 个客户端 id>=2，
+    //     退出时会把房主端整个会话关掉。这里把 id>=2 的客户端退出改为：房主端只断开
+    //     该客户端连接，客户端端仅 Unlink（不断开与服务器的连接）；房主（id==0）退出
+    //     仍走原逻辑结束游戏。
+    [HarmonyPatch(typeof(Peer_Extensions), "Disconnect")]
+    internal static class Patch_PeerDisconnect_KeepSession
+    {
+        private static bool Prefix(Peer peer, DisconnectDetail disconnectDetail)
+        {
+            if (peer == null)
+            {
+                return true;
+            }
+            int id = peer.Id;
+            if (id == 0 || id == 1)
+            {
+                return true; // 房主退出 / 原版第 2 人：保留原逻辑
+            }
+            try
+            {
+                MultiplayerMng.LogError(string.Format("Disconnect peer {0} {1}", id, disconnectDetail), null);
+                MultiplayerMng.DisconnectPayload.Set(disconnectDetail);
+                PlayerRegistry.Unlink(peer);
+                BoltEntity entity = peer.entity;
+                if (BoltNetwork.IsServer && entity != null && entity.Source != null)
+                {
+                    entity.Source.Disconnect(); // 房主端：只断开该客户端的连接
+                }
+                // 客户端端：实体销毁由 Bolt 处理，这里不断开与服务器的连接
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning("[MultiplayerPlus] peer disconnect keep-session failed: " + e.Message);
+            }
+            return false;
+        }
+    }
+
+    // 15b. 直连模式没有 matchmaking 会话，客户端退出时房主端 UpdateToken() 会因
+    //      BoltMatchmaking.CurrentSession 为 null 抛 NRE（日志刷红字，不影响游戏），
+    //      这里直接跳过。
+    [HarmonyPatch(typeof(MultiplayerMng), "UpdateToken")]
+    internal static class Patch_UpdateTokenSafe
+    {
+        private static bool Prefix()
+        {
+            return Photon.Bolt.Matchmaking.BoltMatchmaking.CurrentSession != null;
+        }
+    }
+
+    // 16. 修复"远程玩家头不可见"：
+    //     头显隐完全由 Character.PlayerCamera_RenderingCameraChanged(ourCamera) 控制。
+    //     其 ourCamera=false 分支（"别人看你"）会：隐藏 FirstPerson、显示 ThirdPerson 并启用头部。
+    //     但远程玩家相机在 PlayerCamera.Attached() 里 SetActive(false)，Cameras_OnPreCull 不会
+    //     为它触发 → 该方法在 MP 下对远程角色从未被调用 → 头停在 prefab 默认（隐藏），
+    //     且默认激活的可能是 FirstPerson 渲染器，单开 TP 头看不到。
+    //     修复思路（用游戏自带的正确逻辑，避免 v1 每帧暴力强制造成的贴图混乱）：
+    //     (a) Prefix 强制非 owner 角色走 ourCamera=false 分支（显示 TP+头、隐藏 FP），
+    //         这样即使原相机事件将来触发也是正确状态；
+    //     (b) Postfix 在 Character.SetPlayer 完成后，显式对非 owner 角色调用一次
+    //         PlayerCamera_RenderingCameraChanged(false)，确保头部一定被启用（不依赖相机事件）。
+    [HarmonyPatch(typeof(Character), "PlayerCamera_RenderingCameraChanged")]
+    internal static class Patch_RenderingCameraChanged_RemoteHead
+    {
+        private static readonly AccessTools.FieldRef<Character, IPlayer> PlayerRef =
+            AccessTools.FieldRefAccess<Character, IPlayer>("_player");
+
+        private static void Prefix(Character __instance, ref bool ourCamera)
+        {
+            try
+            {
+                IPlayer player = PlayerRef(__instance);
+                if (player != null && !player.IsOwner)
+                {
+                    // 远程玩家始终按"别人看你"的第三人称+头部逻辑渲染
+                    ourCamera = false;
+                }
+            }
+            catch (Exception)
+            {
+                // 静默
+            }
+        }
+    }
+
+    [HarmonyPatch(typeof(Character), "SetPlayer")]
+    internal static class Patch_CharacterSetPlayer_RemoteHead
+    {
+        private static readonly AccessTools.FieldRef<Character, IPlayer> PlayerRef =
+            AccessTools.FieldRefAccess<Character, IPlayer>("_player");
+
+        private static readonly MethodInfo RenderMethod =
+            AccessTools.Method(typeof(Character), "PlayerCamera_RenderingCameraChanged", new[] { typeof(bool) });
+
+        private static void Postfix(Character __instance)
+        {
+            try
+            {
+                IPlayer player = PlayerRef(__instance);
+                if (player == null || player.IsOwner)
+                {
+                    return; // 只处理远程玩家；本地玩家由原始相机事件处理
+                }
+                if (RenderMethod == null)
+                {
+                    return;
+                }
+                // 显式触发一次"别人看你"渲染分支：隐藏 FP、显示 TP 并启用头部。
+                // 走游戏自带方法，绝不会造成贴图混乱（v1 直接操作 Renderer 才导致混乱）。
+                RenderMethod.Invoke(__instance, new object[] { false });
+                Debug.Log("[MultiplayerPlus] Remote head fix applied for player " + player.Id);
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning("[MultiplayerPlus] remote head fix failed: " + e.Message);
+            }
+        }
+    }
+
 }

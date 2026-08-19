@@ -24,6 +24,7 @@ namespace MultiplayerPlus
         }
 
         private static MultiplayerPlusUI _instance;
+        private float _lastTick;
 
         private static readonly List<ChatEntry> Messages = new List<ChatEntry>();
         private const int MaxMessages = 100;
@@ -33,6 +34,9 @@ namespace MultiplayerPlus
 
         private bool _chatOpen;
         private string _chatInput = "";
+        // 打开聊天的 T 键当前是否还按着（KeyDown 置 true，KeyUp 置 false）。
+        // 用于：按住 T 时不聚焦输入框（防 T 漏进输入框），松开 T 后才聚焦。
+        private bool _tHeld;
         private float _showMessagesUntil;
         private bool _prevCursorVisible;
         private CursorLockMode _prevCursorLockMode;
@@ -148,9 +152,16 @@ namespace MultiplayerPlus
 
         private void Update()
         {
+            // [诊断] 心跳：确认本组件 Update 在跑（每 3 秒一条，排查"按 T 没反应"时用）
+            if (Time.unscaledTime - _lastTick > 3f)
+            {
+                _lastTick = Time.unscaledTime;
+                Debug.Log("[MP-Tick] Update alive");
+            }
+
             if (_chatOpen)
             {
-                // ESC / Enter 只在聊天栏打开时检测，聊天栏关闭时绝不拦截这些键
+                // ESC / Enter 关闭/发送（聊天打开时）。DrawChat 里的 GUI Event 也会处理，这里是双保险。
                 if (IsKeyDown(KeyCode.Escape))
                 {
                     CloseChat();
@@ -162,14 +173,7 @@ namespace MultiplayerPlus
                     return;
                 }
             }
-            else if (!_ipDialogOpen)
-            {
-                // T 键只在"正常游玩"状态打开（游戏内、未暂停、无背包等 UI 遮挡），防止误开 bug
-                if (CanOpenChat() && IsKeyDown(KeyCode.T))
-                {
-                    OpenChat();
-                }
-            }
+            // 注意：T 键打开聊天框已移到 OnGUI() 用 GUI Event 检测（更可靠），见 OnGUI()。
         }
 
         // 键盘检测：Unity Input + Rewired 键盘控制器双保险（游戏用 Rewired，可能影响 Unity Input）
@@ -215,7 +219,10 @@ namespace MultiplayerPlus
             {
                 // ignore
             }
-            if (Cursor.lockState != CursorLockMode.Locked)
+            // 游戏游玩时光标实际为 Confined（见 RewiredUtilities：锁鼠标时设为 Confined 而非 Locked），
+            // 原判断写成 != Locked 会把正常游玩也拦截，导致 T 永远打不开聊天框。
+            // 改为仅在光标被完全释放（None，如全屏菜单/窗口失焦）时拦截。
+            if (Cursor.lockState == CursorLockMode.None)
             {
                 return false;
             }
@@ -236,6 +243,35 @@ namespace MultiplayerPlus
 
         private void OnGUI()
         {
+            // T 键打开聊天框：用 GUI Event 系统检测按键（比 Update+Input.GetKeyDown 更可靠，
+            // 聊天 UI 本身就在 OnGUI 绘制，生命周期一致；之前放在 Update 里检测不到 T 导致打不开）。
+            if (UnityEngine.Event.current != null && UnityEngine.Event.current.type == UnityEngine.EventType.KeyDown && UnityEngine.Event.current.keyCode == KeyCode.T)
+            {
+                if (!_chatOpen && !_ipDialogOpen)
+                {
+                    if (CanOpenChat())
+                    {
+                        OpenChat();
+                        _tHeld = true; // 记下“打开键”还按着，等松开再聚焦输入框
+                        Debug.Log("[MP-Chat-Diag] T -> chat opened");
+                    }
+                    else
+                    {
+                        Debug.Log(string.Format(
+                            "[MP-Chat-Diag] T blocked | GameState={0} IsPaused={1} CursorLock={2}",
+                            Game.State, IsGamePausedNow(), Cursor.lockState));
+                    }
+                    UnityEngine.Event.current.Use();
+                }
+                // 聊天打开状态下按 T：不拦截，交给输入框正常输入 't'（不要 Use）
+            }
+            else if (UnityEngine.Event.current != null && UnityEngine.Event.current.type == UnityEngine.EventType.KeyUp && UnityEngine.Event.current.keyCode == KeyCode.T)
+            {
+                // “打开键”松开：标记可聚焦（DrawChat 里据此把焦点给输入框）
+                _tHeld = false;
+                UnityEngine.Event.current.Use();
+            }
+
             EnsureStyles();
 
             // 聊天只在游戏内显示（主菜单不显示聊天消息）
@@ -265,6 +301,11 @@ namespace MultiplayerPlus
         {
             _chatOpen = true;
             _chatInput = "";
+            // 关键：清空 Unity 全局键盘焦点。IMGUI 关闭聊天后 GUIUtility.keyboardControl
+            // 仍残留指向 MPChatInput（控件 ID 布局稳定、每次相同），导致第二次起打开聊天时
+            // 输入框一绘制就处于“残留聚焦”状态，会把打开聊天的 T 按键吞进输入框（多出 't'）。
+            // 每次打开都强制清焦，让输入框回到“从未聚焦”的干净起点。
+            GUIUtility.keyboardControl = 0;
             _prevCursorVisible = Cursor.visible;
             _prevCursorLockMode = Cursor.lockState;
             Cursor.visible = true;
@@ -280,6 +321,8 @@ namespace MultiplayerPlus
             }
             _chatOpen = false;
             _chatInput = "";
+            _tHeld = false;
+            GUIUtility.keyboardControl = 0; // 关闭时同步清焦，避免焦点残留到下次打开
             Cursor.visible = _prevCursorVisible;
             Cursor.lockState = _prevCursorLockMode;
             SetPlayerInputEnabled(true);
@@ -397,7 +440,12 @@ namespace MultiplayerPlus
 
                 GUI.SetNextControlName("MPChatInput");
                 _chatInput = GUI.TextField(new Rect(x + pad, ty, inputW, inputH), _chatInput, _inputStyle);
-                GUI.FocusControl("MPChatInput");
+                // 聚焦：打开聊天且“打开键 T”还按着时不聚焦（防止 T 漏进输入框）；
+                // 一旦 T 松开就聚焦，并且之后每帧保持焦点，确保输入框持续可输入。
+                if (!_tHeld)
+                {
+                    GUI.FocusControl("MPChatInput");
+                }
 
                 if (GUI.Button(new Rect(x + pad + inputW + btnGap, ty, btnW, inputH), "发送", _buttonStyle))
                 {
